@@ -204,9 +204,17 @@ class TestNetNS(object):
         # please notice, that IPRoute / IPDB, started in a netns, will continue
         # to work in a given netns even if the process changes to another netns
         #
+        with open("/etc/resolv.conf", 'r') as tmp_fd:
+            main_resolv = tmp_fd.readlines()
+        if not os.path.exists("/etc/netns/{}".format(foo)):
+            os.makedirs("/etc/netns/{}".format(foo))
+        with open("/etc/netns/{}/resolv.conf".format(foo), 'w') as tmp_fd:
+            tmp_fd.write("# foo")
         with IPRoute() as ip:
             links_main1 = set([x.get('index', None) for x in ip.get_links()])
         netnsmod.setns(foo)
+        with open("/etc/resolv.conf", 'r') as tmp_fd:
+            assert tmp_fd.readlines() == ['# foo']
         with IPRoute() as ip:
             links_foo = set([x.get('index', None) for x in ip.get_links()])
         netnsmod.setns(fd)
@@ -214,7 +222,11 @@ class TestNetNS(object):
             links_main2 = set([x.get('index', None) for x in ip.get_links()])
         assert links_main1 == links_main2
         assert links_main1 != links_foo
+        with open("/etc/resolv.conf", 'r') as tmp_fd:
+            assert tmp_fd.readlines() == main_resolv
         netnsmod.remove(foo)
+        os.remove("/etc/netns/{}/resolv.conf".format(foo))
+        os.rmdir("/etc/netns/{}".format(foo))
         fd.close()
 
     def test_move_ns_fd(self):
