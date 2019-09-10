@@ -109,11 +109,14 @@ __NR = {'x86_': {'64bit': 308},
 __NR_setns = __NR.get(config.machine[:4], {}).get(config.arch, 308)
 
 CLONE_NEWNET = 0x40000000
+CLONE_NEWNS = 0x20000
 MNT_DETACH = 0x00000002
 MS_BIND = 4096
 MS_REC = 16384
+MS_SLAVE = 1 << 19
 MS_SHARED = 1 << 20
 NETNS_RUN_DIR = '/var/run/netns'
+NETNS_ETC_DIR = '/etc/netns'
 
 __saved_ns = []
 
@@ -277,7 +280,49 @@ def remove(netns, libc=None):
     os.unlink(netnspath)
 
 
-def setns(netns, flags=os.O_CREAT, libc=None):
+def _unbind_etc(nsfd, libc, netns_etc_dir):
+    '''
+    Unmount /etc/netns files like resolv.config
+    '''
+    st = os.fstat(nsfd)
+    netns_name = _get_ns_by_inode().get(st.st_dev, {}).get(st.st_ino)
+    # No need to unbind in case of default netns
+    if not netns_name:
+        return
+    etc_netns_path = os.path.join(netns_etc_dir, netns_name)
+    if not os.path.isdir(etc_netns_path):
+        return
+    for filename in os.listdir(etc_netns_path):
+        if not os.path.exists(os.path.join('/etc', filename)):
+            continue
+        if libc.umount2(os.path.join('/etc', filename).encode('utf8'), MNT_DETACH) < 0:
+            raise OSError(ctypes.get_errno(), 'umount failed', os.path.join('/etc', filename), netns_name)
+
+
+def _bind_etc(nsfd, libc, netns_etc_dir):
+    '''
+    Mount /etc/netns files like resolv.config
+    '''
+    st = os.fstat(nsfd)
+    netns_name = _get_ns_by_inode().get(st.st_dev, {}).get(st.st_ino)
+    # No need to unbind in case of default netns
+    if not netns_name:
+        return
+    etc_netns_path = os.path.join(netns_etc_dir, netns_name)
+    if not os.path.isdir(etc_netns_path):
+        return
+    for filename in os.listdir(etc_netns_path):
+        if not os.path.exists(os.path.join('/etc', filename)):
+            continue
+        if libc.mount(os.path.join(etc_netns_path, filename).encode('utf8'),
+                      os.path.join('/etc', filename).encode('utf8'),
+                      b'none',
+                      MS_BIND,
+                      None) != 0:
+            raise OSError(ctypes.get_errno(), 'mount failed', os.path.join('/etc', filename), netns_name)
+
+
+def setns(netns, flags=os.O_CREAT, libc=None, netns_etc_dir=NETNS_ETC_DIR):
     '''
     Set netns for the current process.
 
@@ -299,6 +344,9 @@ def setns(netns, flags=os.O_CREAT, libc=None):
     '''
     newfd = False
     libc = libc or ctypes.CDLL(ctypes.util.find_library('c'), use_errno=True)
+    lastfd = os.open('/proc/self/ns/net', os.O_RDONLY)
+    _unbind_etc(lastfd, libc, netns_etc_dir)
+    os.close(lastfd)
     if isinstance(netns, basestring):
         netnspath = _get_netnspath(netns)
         if os.path.basename(netns) in listnetns(os.path.dirname(netns)):
@@ -316,13 +364,19 @@ def setns(netns, flags=os.O_CREAT, libc=None):
     else:
         raise RuntimeError('netns should be a string or an open fd')
     error = libc.syscall(__NR_setns, nsfd, CLONE_NEWNET)
+    # unshare
+    if libc.unshare(CLONE_NEWNS) < 0:
+        raise OSError(ctypes.get_errno(), 'unshare failed')
+    if libc.mount(b"", b"/", b"none", MS_SLAVE | MS_REC, None) != 0:
+        raise OSError(ctypes.get_errno(), 'mount --make-rslave failed')
+    _bind_etc(nsfd, libc, netns_etc_dir)
     if newfd:
         os.close(nsfd)
     if error != 0:
         raise OSError(ctypes.get_errno(), 'failed to open netns', netns)
 
 
-def pushns(newns=None, libc=None):
+def pushns(newns=None, libc=None, netns_etc_dir=NETNS_ETC_DIR):
     '''
     Save the current netns in order to return to it later. If newns is
     specified, change to it::
@@ -336,17 +390,17 @@ def pushns(newns=None, libc=None):
     global __saved_ns
     __saved_ns.append(os.open('/proc/self/ns/net', os.O_RDONLY))
     if newns is not None:
-        setns(newns, libc=libc)
+        setns(newns, libc=libc, netns_etc_dir=netns_etc_dir)
 
 
-def popns(libc=None):
+def popns(libc=None, netns_etc_dir=NETNS_ETC_DIR):
     '''
     Restore the previously saved netns.
     '''
     global __saved_ns
     fd = __saved_ns.pop()
     try:
-        setns(fd, libc=libc)
+        setns(fd, libc=libc, netns_etc_dir=netns_etc_dir)
     except Exception:
         __saved_ns.append(fd)
         raise
